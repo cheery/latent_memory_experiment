@@ -64,6 +64,11 @@ class Config:
     reader_lora: bool = False  # False: the student (reader of latents) is the untouched base model, as in
                                # Coca-Cola; LoRA only shapes the compressor. True: the q06_3k behaviour.
     ptr_dim: int = 128
+    writer: str = "beacon"     # "beacon": compressor = base + LoRA + beacons (default). "pool": LatentPress-style
+                               # lightweight writer (arXiv 2609.01507): the reader's bottom `pool_layers` layers,
+                               # frozen, + an identity-initialised d x d linear adapter, mean-pooled over each
+                               # block / k_lat token sub-span. Only the adapter is trained; no LoRA.
+    pool_layers: int = 2
 
 
 @dataclass
@@ -118,7 +123,7 @@ class RollingQwen(nn.Module):
         for p in lm.parameters():
             p.requires_grad_(False)
         self.loras = []
-        for layer in lm.model.layers:
+        for layer in (lm.model.layers if c.writer != "pool" else []):
             # Qwen3: self_attn + mlp in every layer. Qwen3.5: full-attention layers have self_attn, Gated DeltaNet
             # layers have linear_attn (in_proj_qkv, in_proj_z, out_proj; the per-head in_proj_a/b are left alone)
             for pname in ("self_attn", "linear_attn", "mlp"):
@@ -144,6 +149,15 @@ class RollingQwen(nn.Module):
         for m in (self.adapter, self.div_head, self.ptr_q, self.ptr_k):
             for p in m.parameters():
                 nn.init.normal_(p, std=0.02) if p.dim() > 1 else nn.init.zeros_(p)
+        if c.writer == "pool":
+            self.pool_adapter = nn.Linear(D, D, bias=False).to(dev)        # fp32 head, identity at the start, so
+            with torch.no_grad():                                          # latents begin as pooled layer-L states
+                self.pool_adapter.weight.copy_(torch.eye(D, device=dev))
+            for m in (self.beacons, self.lat_type):                        # beacon compressor parts are unused
+                m.requires_grad_(False)
+            for m in (self.adapter, self.lat_out_norm):
+                for p in m.parameters():
+                    p.requires_grad_(False)
 
     @property
     def dtype(self):
@@ -187,6 +201,39 @@ class RollingQwen(nn.Module):
 
     def logits(self, h):
         return self.lm.lm_head(h).float()
+
+    @torch.no_grad()
+    def bottom_states(self, ids, start, chunk=16384):
+        """Residual stream after the bottom c.pool_layers layers (before any final norm) for token ids (1, T) at
+        positions start..start+T-1. Runs the frozen model truncated to those layers. Inputs longer than `chunk`
+        are encoded in independent chunks (the bottom layers' context does not cross a chunk boundary)."""
+        L, mdl = self.c.pool_layers, self.lm.model
+        out, keep = [], mdl.config.num_hidden_layers
+        captured = {}
+        hook = mdl.layers[L - 1].register_forward_hook(
+            lambda m, a, o: captured.__setitem__("h", o[0] if isinstance(o, tuple) else o))
+        mdl.config.num_hidden_layers = L
+        try:
+            with self.lora(False):
+                for a in range(0, ids.shape[1], chunk):
+                    part = ids[:, a:a + chunk]
+                    self.hidden(self.embed(part), start + a + torch.arange(part.shape[1], device=ids.device))
+                    out.append(captured["h"])
+        finally:
+            mdl.config.num_hidden_layers = keep
+            hook.remove()
+        return torch.cat(out, 1)
+
+    def write_doc(self, ids, start):
+        """LatentPress-style writer: ids (1, n_blocks * block) -> list of n_blocks latents (1, k_lat, D). Each latent
+        is the adapter applied to the mean of a block / k_lat token sub-span, so it sits at that sub-span's end
+        (lat_pos). The bottom layers are frozen (no grad); gradients reach only pool_adapter."""
+        c = self.c
+        s = c.block // c.k_lat
+        n = ids.shape[1] // c.block
+        h = self.bottom_states(ids[:, :n * c.block], start).float()
+        z = self.pool_adapter(h.view(1, n, c.k_lat, s, -1).mean(3))       # pool first: same as adapting each token
+        return [z[:, j] for j in range(n)]
 
     def lat_pos(self, start, device):
         s = self.c.block // self.c.k_lat

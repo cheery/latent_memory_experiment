@@ -87,6 +87,24 @@ latent = RMSNorm(MLP(h)) * rms(token embeddings, detached) + type_vector        
 - Compression happens once per block, at eviction time, and is the main
   inference cost (~0.1 s per block at 9B on an L40S).
 
+### Alternative: a lightweight writer (`--writer pool`)
+
+Following LatentPress (arXiv 2609.01507): run the frozen reader's bottom 2
+layers once over the whole document, apply an identity-initialised d x d
+linear adapter (the only trained part, 16.8M parameters at d = 4096; no
+LoRA), and mean-pool each 16-token sub-span into one latent at its end. It
+is query-independent and roughly 100x cheaper to compress with than the
+LoRA compressor; training takes 0.7–1.3 s per step and 24 GB instead of
+4–6 s and 37 GB.
+
+| 32 questions, 4 blocks, EM (F1) | LoRA compressor (step 250) | pool writer (step 500) |
+|---|---|---|
+| latents | 0.31 (0.34) | 0.22 (0.27) |
+| latents + gold blocks | 0.59 (0.72) | 0.56 (0.67) |
+
+Its latents carry less gist; whether that matters once recall supplies the
+detail is being measured.
+
 ## 4. The reader
 
 The **frozen base model with LoRA off** reads the latents. It is exactly the

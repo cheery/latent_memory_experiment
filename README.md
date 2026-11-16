@@ -89,7 +89,10 @@ Worth putting out, yes. A full conference paper, not yet.
 1. **A head-to-head with LCLM's `expand` agent:** run this recall policy on LCLM's open 16x model
    (huggingface.co/latent-context) against its trained tool calls, on RULER needle-in-a-haystack and
    HotpotQA. It needs inference only.
-2. **A lightweight writer** in the style of LatentPress, to cut the compression cost.
+2. **A lightweight writer** in the style of LatentPress, to cut the compression cost. Implemented
+   (`train --writer pool`; see `latent_memory.md`, section 3). It trains about 4x faster and
+   compresses about 100x cheaper, with weaker latents on their own (0.22 vs 0.31 EM). Its results
+   with recall are pending.
 3. Benchmarks where keyword RAG struggles: chains whose next hop is not named in the question (RULER
    variable tracking), memory with updated facts (LongMemEval), and one benchmark shared with
    Memorilla (NarrativeQA or TriviaQA).

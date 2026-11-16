@@ -162,6 +162,8 @@ def compress_doc(model, s: Sample, qcond):
     """Latents for every block, as at eviction time: each conditioned on <= n_blocks-1 earlier latents and on the
     next window of the document (streaming) or on the question (placed where it will appear)."""
     c = model.c
+    if c.writer == "pool":                                             # LatentPress-style writer: query-independent,
+        return model.write_doc(s.doc[None, :s.Ld], s.P)                # one pass of the bottom layers over the document
     lats = []
     for i in range(s.n):
         st = s.P + i * s.Bk
@@ -244,7 +246,7 @@ def train(args):
     dev = pick_device()
     torch.manual_seed(args.seed); random.seed(args.seed); np.random.seed(args.seed)
     c = Config(model=args.model, block=args.block, k_lat=args.k_lat, n_blocks=args.n_blocks, window=args.window,
-               future=0, lora_r=args.lora_r, reader_lora=False)
+               future=0, lora_r=args.lora_r, reader_lora=False, writer=args.writer, pool_layers=args.pool_layers)
     cc = ChatCfg(**{f.name: getattr(args, f.name) for f in fields(ChatCfg)})
     tok = AutoTokenizer.from_pretrained(c.model)
     train_set, val_set = load_jsonl(args.data + "_train.jsonl"), load_jsonl(args.data + "_val.jsonl")
@@ -940,6 +942,37 @@ def selftest():
     assert rl["questions"] == 2 and all(rl[m][2] <= 320 for m in ("truncate", "rag_fill", "oracle", "latents"))
     ok("long_eval: every mode fits the context budget, truncation / RAG baselines, resumable")
     ok("chat_demo prints every mode")
+    # LatentPress-style writer: frozen bottom layers + identity-initialised adapter, mean-pooled sub-spans
+    cp = Config(model="tiny", block=32, k_lat=4, n_blocks=3, window=16, future=0, lora_r=4, reader_lora=False,
+                writer="pool", pool_layers=2)
+    lm2 = Qwen3_5ForCausalLM(qc).float(); lm2.config._attn_implementation = "sdpa"
+    lm2.load_state_dict(lm.state_dict(), strict=False)
+    pm = RollingQwen(cp, lm2.to(dev)).to(dev)
+    trainable = {n for n, p in pm.named_parameters() if p.requires_grad}
+    assert "pool_adapter.weight" in trainable and not pm.loras and not any(".A" in n or ".B" in n for n in trainable)
+    assert not pm.beacons.requires_grad and not any(p.requires_grad for p in pm.lm.parameters())
+    sp = Sample(data[2], data, Tok, cp, 3, random.Random(2), dev=dev)
+    with torch.no_grad():
+        ids = sp.doc[None, :sp.Ld]
+        hs = pm.lm.model(inputs_embeds=pm.embed(ids), position_ids=(sp.P + torch.arange(sp.Ld, device=dev))[None],
+                         attention_mask=torch.ones_like(ids), output_hidden_states=True).hidden_states
+        lats = pm.write_doc(ids, sp.P)
+        ref = hs[2].float().view(1, 3, 4, 8, -1).mean(3)               # identity adapter: pooled layer-2 states
+        assert len(lats) == 3 and torch.allclose(lats[1], ref[:, 1], atol=1e-4), (lats[1] - ref[:, 1]).abs().max()
+    ok("pool writer: only the d x d adapter trains (no LoRA); identity init = mean-pooled layer-2 states")
+    optp = torch.optim.Adam([p for p in pm.parameters() if p.requires_grad], lr=1e-2)
+    first = None
+    for _ in range(40):
+        loss, info = chat_loss(pm, sp, cc, False, False)
+        first = first if first is not None else loss.item()
+        optp.zero_grad(); loss.backward()
+        assert pm.pool_adapter.weight.grad.abs().sum() > 0
+        optp.step()
+    assert loss.item() < first, (first, loss.item())
+    res_p = chat_eval(pm, Tok, data[:4], data, n_blocks=3, n_q=2, thinking_modes=(False,), verbose=False,
+                      modes=("full", "none", "latents", "oracle"), retrievers=("bm25",))
+    assert res_p["questions"] == 2
+    ok(f"pool writer trains through chat_loss ({first:.3f} -> {loss.item():.3f}) and runs in chat_eval")
     assert em_f1("The Eiffel Tower", "eiffel tower") == (1.0, 1.0) and em_f1("Paris, France", "Paris")[1] > 0.6
     ok("EM/F1 normalisation")
     print("SELFTEST PASSED")
@@ -963,6 +996,9 @@ def main():
     t.add_argument("--n_blocks", type=int, default=4)
     t.add_argument("--window", type=int, default=128)
     t.add_argument("--lora_r", type=int, default=16)
+    t.add_argument("--writer", choices=("beacon", "pool"), default="beacon",
+                   help="pool: LatentPress-style writer (frozen bottom layers + identity-init linear adapter)")
+    t.add_argument("--pool_layers", type=int, default=2)
     t.add_argument("--steps", type=int, default=1000)
     t.add_argument("--batch", type=int, default=4)
     t.add_argument("--lr", type=float, default=2e-4)
