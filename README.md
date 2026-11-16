@@ -107,6 +107,11 @@ python rolling_latent_chat.py selftest
 python rolling_latent_qwen.py selftest
 ```
 
+**Trained checkpoint.** The weights behind the results (`chat9b.pt`: LoRA + compressor + heads
+for Qwen3.5-9B, 74.8M parameters, step 1000, 299 MB, fp32) are not in this repository. They are
+available on request and can be put on Hugging Face if there is interest. The base model is
+`Qwen/Qwen3.5-9B` (Apache-2.0).
+
 Training and evaluation need a GPU with about 40 GB (training) or about 24 GB (inference) for the 9B
 model; see `latent_memory.md`, section 10, for the commands and costs.
 
