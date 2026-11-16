@@ -24,10 +24,18 @@ Worth putting out, yes. A full conference paper, not yet.
   and 10.0% only by RAG), that their union beats both, and it explicitly names "hybrid retrieval and
   latent-memory systems" as future work. This is such a hybrid: latents for gist, plus
   uncertainty-triggered recall of the raw text.
-- **The two closest papers have no recall.** Coca-Cola (arXiv 2611.06500) compresses tool
-  observations into latents with no way back to the original. Memorilla produces a fixed set of
-  query-conditioned memory tokens and doesn't recall either. "You don't need long context" (arXiv
-  2611.05306) recalls raw text, but its compact state is text, not latents.
+- **Recall over latents exists, but how to choose what to expand is open.** Coca-Cola (arXiv
+  2611.06500) and LatentPress (arXiv 2609.01507) compress into latents with no way back to the
+  original; Memorilla produces a fixed set of query-conditioned memory tokens without recall. The
+  closest prior work is LCLM ("End-to-End Context Compression at Scale", arXiv 2606.09659): its agent
+  keeps a whole compressed corpus in context and calls an `expand(segment_id)` tool that returns the
+  raw text, lifting RULER needle-in-a-haystack at 16x from 70–81% to 95–99%. It learns when and
+  where to expand from synthetic tool trajectories, after ~400B tokens of training, and names "how
+  to choose which context to expand" as future work. That choice is what this repository studies:
+  a training-free policy (an entropy trigger, then expanding each candidate and keeping the one that
+  makes the model most confident, with a second retrieval hop), compared against the alternatives.
+  "You don't need long context" (arXiv 2611.05306) recalls raw text too, but its compact state is
+  text, not latents.
 - **Several findings are useful to others, and some go against intuition:**
   - Latents that contain a block perfectly (they regenerate it exactly) can be harmful as memory,
     roughly doubling the reader's loss. Archive latents and context latents are different things.
@@ -40,6 +48,10 @@ Worth putting out, yes. A full conference paper, not yet.
     blocking attention to the latents.
   - With thinking on, the model reasons the latents away ("only one snippet is provided"), while
     recall keeps working.
+- **Independent confirmation of the design.** LatentPress, built separately, makes the same core
+  choices: a frozen reader, latents fed into the input-embedding layer, and a CE + KL
+  self-distillation loss. It also finds 16x to be the hard rate and compressed context sometimes
+  beating raw context.
 - **The headline result is solid as parity.** Recall matches reading the full document at 2k and 8k
   tokens, and the best RAG baseline at 131k tokens within a 16k budget, from a fraction of the raw
   text.
@@ -55,21 +67,35 @@ Worth putting out, yes. A full conference paper, not yet.
 - **The pieces have prior art,** which a paper must cite and position against:
   - triggering retrieval on model uncertainty: FLARE, Self-RAG;
   - choosing documents by how much they help the LM: REPLUG-style likelihood scoring;
-  - rolling compression by the same model: AutoCompressors, Activation Beacon.
+  - rolling compression by the same model: AutoCompressors, Activation Beacon;
+  - latents plus an `expand` tool that returns raw text: LCLM (arXiv 2606.09659), trained end to end
+    at scale.
 
-  The contribution is the combination (a cache hierarchy with latent gist plus raw recall) and the
-  analysis, not any single new component.
-- **There is no cost or latency comparison yet.** Compressing 512 blocks takes about 50 seconds per
-  question on an L40S; a cost-versus-accuracy curve is needed.
+  The contribution is the *selection policy* for recall (when to recall and which segment), its
+  comparison against alternatives with a per-question failure breakdown, and doing it with a frozen
+  reader and a cheap LoRA compressor; not the cache hierarchy itself.
+- **The reader is frozen, which may cap the results.** LCLM reports that frozen-decoder and LoRA
+  variants "substantially underperform" full end-to-end training. It also compacts the model's own
+  reasoning into latents almost losslessly (MATH 90.5% vs 92.5%) with a decoder trained on
+  compressed reasoning. That suggests the "thinking ignores latents" problem here needs reader
+  training, not only compressor training.
+- **There is no cost or latency comparison yet, and compression is slow.** Compressing 512 blocks
+  takes about 50 seconds per question on an L40S, because each block is a full pass of the 9B model
+  with LoRA. LatentPress writes a conversation in about 43 ms with a writer made of two borrowed
+  decoder layers plus a small adapter. A cost-versus-accuracy curve is needed.
 
 ### What would make it a solid paper
 
-1. Benchmarks where keyword RAG struggles: chains whose next hop is not named in the question (RULER
+1. **A head-to-head with LCLM's `expand` agent:** run this recall policy on LCLM's open 16x model
+   (huggingface.co/latent-context) against its trained tool calls, on RULER needle-in-a-haystack and
+   HotpotQA. It needs inference only.
+2. **A lightweight writer** in the style of LatentPress, to cut the compression cost.
+3. Benchmarks where keyword RAG struggles: chains whose next hop is not named in the question (RULER
    variable tracking), memory with updated facts (LongMemEval), and one benchmark shared with
    Memorilla (NarrativeQA or TriviaQA).
-2. Stronger baselines: dense-retriever RAG, and a compression-only baseline.
-3. Larger evaluations (500+ questions, 2–3 seeds) with confidence intervals.
-4. A cost-versus-accuracy plot.
+4. Stronger baselines: dense-retriever RAG, and a compression-only baseline.
+5. Larger evaluations (500+ questions, 2–3 seeds) with confidence intervals.
+6. A cost-versus-accuracy plot.
 
 ## Results
 
@@ -117,6 +143,11 @@ model; see `latent_memory.md`, section 10, for the commands and costs.
 
 ## Related work
 
+- LCLM, "End-to-End Context Compression at Scale": an encoder–decoder compressor trained on ~400B
+  tokens, an agent that expands compressed segments with a tool, and online compaction of
+  reasoning. arXiv 2606.09659. The closest prior work for recall.
+- LatentPress: a frozen reader, a tiny writer, CE + KL self-distillation, and role-based
+  compression rates; LongMemEval and LongBench-QA. arXiv 2609.01507.
 - Coca-Cola: latent context compression for agents, action-preserving training. arXiv 2611.06500.
 - Memorilla: latent semantic memory for LLMs. arXiv 2610.21375.
 - You don't need long context: compaction and selective reading. arXiv 2611.05306.
