@@ -1,0 +1,6 @@
+torch
+numpy
+transformers==5.23.0
+pyarrow                   # HotpotQA parquet (prep)
+flash-linear-attention    # optional: ~24% faster Qwen3.5 training, less memory
+modal                     # optional: running on Modal GPUs (modal_rllm.py)
