@@ -830,6 +830,95 @@ def print_long(res):
           f"{res['V4_para_entropy_2hop_hit_all']:.3f} | truncation window holds gold {res['truncate_has_gold']:.3f}")
 
 
+# ============================================================================ probe: what does the model see?
+
+PROBES = {"describe": "What do you see in the documents above? Describe them in detail.",
+          "titles": "List the titles of the documents above, one per line.",
+          "question": None}                                        # None: the HotpotQA question of the sample
+
+
+def probe_titles(s: Sample, tok):
+    """Titles of the paragraphs whose text lies in the compressed blocks ("Title: X\n..." at their start)."""
+    out = []
+    for a, b, _ in s.paras:
+        head = tok.decode(s.doc[a:min(b, a + 40)].tolist())
+        m = re.match(r"Title: ([^\n]+)", head)
+        if m and b <= s.Ld:
+            out.append(m.group(1).strip())
+    return out
+
+
+def title_hits(text, titles):
+    """(true titles mentioned, listed lines that match no true title)."""
+    low = text.lower()
+    hit = sum(1 for t in titles if t.lower() in low)
+    lines = [l.strip(" -*•0123456789.").strip() for l in text.splitlines() if l.strip()]
+    invented = sum(1 for l in lines if l and not any(t.lower() in l.lower() or l.lower() in t.lower() for t in titles))
+    return hit, invented
+
+
+@torch.no_grad()
+def probe(model, tok, val_set, pool, n_docs=12, n_blocks=8, show=4, max_new=200, think_budget=256, out_jsonl=None,
+          seed=777):
+    """Ask the model what it sees. Context = neutral instruction + the documents as latents (no raw window, so
+    everything comes from the latents), as raw text (reference), or absent (confabulation baseline). Prompts:
+    a free description (also with thinking on), a title list (scored against the real titles), the question."""
+    model.eval()
+    c, dev = model.c, next(model.parameters()).device
+    rng = random.Random(seed)
+    rows, f = [], open(out_jsonl, "a") if out_jsonl else None
+    for k, qi in enumerate(rng.sample(range(len(val_set)), n_docs)):
+        ex = val_set[qi]
+        s = Sample(ex, pool, tok, c, n_blocks, random.Random(seed + k), dev=dev)
+        s.prefix = torch.tensor(tok.encode("<|im_start|>user\nHere are some documents.\n\n<documents>\n"), device=dev)
+        s.P = len(s.prefix)
+        lat = compress_doc(model, s, qcond=False)
+        titles = probe_titles(s, tok)
+        contexts = {"latents": parts_for(s, lat), "full": parts_for(s, None, raw_all=True), "none": [("raw", s.prefix[None], 0)]}
+        ts = s.tail_start(with_window=False)                       # positions continue after the (absent) window
+        r = dict(qi=qi, q=ex["q"], gold=ex["a"], titles=titles, n_blocks=n_blocks)
+        if k < show:
+            print(f"\n=== document {k + 1}: {len(titles)} paragraphs in the compressed blocks, e.g. {titles[:5]}"
+                  f"\n    question: {ex['q']}  (gold: {ex['a']})")
+        for pname, ptext in PROBES.items():
+            ptext = ptext or ex["q"]
+            for thinking in ((False, True) if pname == "describe" else (False,)):
+                suffix = (f"\n</documents>\n\n{ptext}<|im_end|>\n<|im_start|>assistant\n"
+                          + ("<think>\n" if thinking else "<think>\n\n</think>\n\n"))
+                tail = torch.tensor(tok.encode(suffix), device=dev)[None]
+                for cname, parts in contexts.items():
+                    if thinking and cname == "none":
+                        continue
+                    ans, _ = generate(model, parts, tail, ts, tok, max_new=max_new if pname != "question" else 32,
+                                      think_budget=think_budget if thinking else 0)
+                    key = f"{pname}{'_think' if thinking else ''}_{cname}"
+                    hit, inv = title_hits(ans, titles)
+                    r[key] = dict(text=ans, title_hits=hit, invented=inv,
+                                  thought=generate.last_text.split("</think>")[0][:600] if thinking else None,
+                                  f1=em_f1(ans, ex["a"])[1] if pname == "question" else None)
+                    if k < show:
+                        extra = (f" [titles {hit}/{len(titles)}, invented lines {inv}]" if pname != "question"
+                                 else f" [F1 {r[key]['f1']:.2f}]")
+                        print(f"--- {key}{extra}\n{ans[:700]}")
+                        if thinking:
+                            print(f"    (thinking: {r[key]['thought'][:400]!r})")
+        rows.append(r)
+        if f:
+            f.write(json.dumps(r) + "\n"); f.flush()
+    if f:
+        f.close()
+    print(f"\nSUMMARY over {len(rows)} documents (titles in compressed blocks per document: "
+          f"{np.mean([len(r['titles']) for r in rows]):.1f})")
+    for key in [k for k in rows[0] if isinstance(rows[0][k], dict)]:
+        if key.startswith("question"):
+            print(f"  {key:>22}: answer F1 {np.mean([r[key]['f1'] for r in rows]):.3f}")
+        else:
+            th = np.mean([r[key]["title_hits"] / max(1, len(r["titles"])) for r in rows])
+            print(f"  {key:>22}: true titles mentioned {th:.3f} | invented lines {np.mean([r[key]['invented'] for r in rows]):.1f}")
+    model.train()
+    return rows
+
+
 def print_chat_report(res):
     print(f"\n{res['questions']} HotpotQA questions, {res['n_blocks']} blocks per document")
     rows = sorted({k[:-3] for k in res if k.endswith("_em")})
@@ -973,6 +1062,12 @@ def selftest():
                       modes=("full", "none", "latents", "oracle"), retrievers=("bm25",))
     assert res_p["questions"] == 2
     ok(f"pool writer trains through chat_loss ({first:.3f} -> {loss.item():.3f}) and runs in chat_eval")
+    class ProbeTok(Tok):
+        eos_token_id = -1
+    rows = probe(pm, ProbeTok, data[:6], data, n_docs=2, n_blocks=3, show=1, max_new=6, think_budget=4)
+    assert len(rows) == 2 and "describe_think_latents" in rows[0] and "titles_none" in rows[0]
+    assert title_hits("Alpha Beta\nZeta", ["alpha beta", "gamma"]) == (1, 1)
+    ok("probe runs: describe (thinking off/on), titles, question x latents / full / none")
     assert em_f1("The Eiffel Tower", "eiffel tower") == (1.0, 1.0) and em_f1("Paris, France", "Paris")[1] > 0.6
     ok("EM/F1 normalisation")
     print("SELFTEST PASSED")
@@ -984,6 +1079,8 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
+    fe = sub.add_parser("fetch", help="download a model's text weights + tokenizer into the HF cache")
+    fe.add_argument("--model", required=True)
     p = sub.add_parser("prep")
     p.add_argument("--out", default="hotpot")
     p.add_argument("--max_train", type=int, default=30000)
@@ -1010,6 +1107,13 @@ def main():
     t.add_argument("--think_budget", type=int, default=192, help="teacher reasoning tokens for thinking samples")
     for f in fields(ChatCfg):
         t.add_argument(f"--{f.name}", type=float, default=f.default)
+    pr = sub.add_parser("probe", help="ask the model what it sees in latents (vs raw text, vs nothing)")
+    pr.add_argument("--ckpt", required=True)
+    pr.add_argument("--data", default="hotpot")
+    pr.add_argument("--docs", type=int, default=12)
+    pr.add_argument("--blocks", type=int, default=8)
+    pr.add_argument("--show", type=int, default=4)
+    pr.add_argument("--out_jsonl", default=None)
     d = sub.add_parser("chat_demo", help="print the answers for a few questions in every mode")
     d.add_argument("--ckpt", required=True)
     d.add_argument("--data", default="hotpot")
@@ -1044,6 +1148,11 @@ def main():
         selftest()
     elif args.cmd == "prep":
         prep(args)
+    elif args.cmd == "fetch":
+        from huggingface_hub import snapshot_download
+        path = snapshot_download(args.model, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja"])
+        n = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(path) for f in fs)
+        print(f"{args.model}: {n / 2**30:.1f} GiB in {path}")
     elif args.cmd == "train":
         train(args)
     elif args.cmd == "long_eval":
@@ -1069,6 +1178,15 @@ def main():
         res = recall_ablation(model, tok, val, val, n_blocks=args.blocks, n_q=args.q, out_jsonl=args.out_jsonl,
                               variants=vs)
         print_ablation(res, [rc.name for rc in vs])
+    elif args.cmd == "probe":
+        from transformers import AutoTokenizer
+        ck = torch.load(args.ckpt, map_location=pick_device())
+        c = Config(**ck["config"])
+        model = build_model(c, pick_device())
+        model.load_state_dict(ck["trainable"], strict=False)
+        tok = AutoTokenizer.from_pretrained(c.model)
+        val = load_jsonl(args.data + "_val.jsonl")
+        probe(model, tok, val, val, n_docs=args.docs, n_blocks=args.blocks, show=args.show, out_jsonl=args.out_jsonl)
     elif args.cmd == "chat_demo":
         from transformers import AutoTokenizer
         ck = torch.load(args.ckpt, map_location=pick_device())

@@ -102,8 +102,11 @@ LoRA compressor; training takes 0.7–1.3 s per step and 24 GB instead of
 | latents | 0.31 (0.34) | 0.22 (0.27) |
 | latents + gold blocks | 0.59 (0.72) | 0.56 (0.67) |
 
-Its latents carry less gist; whether that matters once recall supplies the
-detail is being measured.
+Its latents carry less gist, but with recall it is nearly as good: V4
+recall reaches 0.54 / 0.68 EM / F1 at 8 blocks (LoRA compressor: 0.57 /
+0.71). At 131k tokens under a 16k budget, over 64 questions, it ties
+RAG-fill (0.45 vs 0.42 EM) while compressing a document in 3 s instead of
+50 s. It is the better default at scale.
 
 ## 4. The reader
 

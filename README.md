@@ -91,8 +91,9 @@ Worth putting out, yes. A full conference paper, not yet.
    HotpotQA. It needs inference only.
 2. **A lightweight writer** in the style of LatentPress, to cut the compression cost. Implemented
    (`train --writer pool`; see `latent_memory.md`, section 3). It trains about 4x faster and
-   compresses about 100x cheaper, with weaker latents on their own (0.22 vs 0.31 EM). Its results
-   with recall are pending.
+   compresses about 16x faster in practice (3 s vs 50 s per 131k-token document). Its latents are
+   weaker on their own, but with recall it is nearly as good: V4 reaches 0.54 vs 0.57 EM at 8 blocks,
+   and at 131k tokens it ties RAG-fill over 64 questions while beating truncation by +0.34 EM.
 3. Benchmarks where keyword RAG struggles: chains whose next hop is not named in the question (RULER
    variable tracking), memory with updated facts (LongMemEval), and one benchmark shared with
    Memorilla (NarrativeQA or TriviaQA).
