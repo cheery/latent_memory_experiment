@@ -1,5 +1,12 @@
 # Latent memory with recall
 
+> **Correction (read first).** In every trained run, the latents collapsed into a near-constant soft
+> prompt: the same for every document (cosine 0.99–1.00), with no document content the reader uses
+> (swap test in `latent_diag`). The recall mechanism (sections 6–7) works and its results stand,
+> because they come from raw text. The descriptions of what latents "carry" below are the design
+> intent, not an observed result. Section 8 lists the swap test as a pitfall; section 11 lists making
+> latents carry content as the open problem.
+
 A way to give a language model a long memory without a long context window.
 Old text is compressed into a few latent vectors per block that stay in the
 context; the raw text is kept outside the context; when the model is unsure,
@@ -18,8 +25,8 @@ The full experimental history, including everything that failed, is in
 | latents | every older block of 256 tokens as 16 vectors (16x) | context | 1 position per 16 tokens |
 | raw store | all text, verbatim | outside (disk, RAM) | none in the context |
 
-Latents are the cache, the raw store is the disk. Latents only need to carry
-the *gist*: enough for the model to answer what it can and to know when it
+Latents are the cache, the raw store is the disk. *By design*, latents only
+need to carry the *gist* (in practice they did not, see the correction above): enough for the model to answer what it can and to know when it
 cannot. Exact detail comes from recall, which copies a block (or paragraph)
 from the raw store back into the context. Because the original is always
 kept, nothing is ever lost.
@@ -102,11 +109,12 @@ LoRA compressor; training takes 0.7–1.3 s per step and 24 GB instead of
 | latents | 0.31 (0.34) | 0.22 (0.27) |
 | latents + gold blocks | 0.59 (0.72) | 0.56 (0.67) |
 
-Its latents carry less gist, but with recall it is nearly as good: V4
-recall reaches 0.54 / 0.68 EM / F1 at 8 blocks (LoRA compressor: 0.57 /
-0.71). At 131k tokens under a 16k budget, over 64 questions, it ties
-RAG-fill (0.45 vs 0.42 EM) while compressing a document in 3 s instead of
-50 s. It is the better default at scale.
+With recall it performs about the same: V4 reaches 0.54 / 0.68 EM / F1 at
+8 blocks (LoRA compressor: 0.57 / 0.71), and at 131k tokens under a 16k
+budget, over 64 questions, it ties RAG-fill (0.45 vs 0.42 EM) while
+compressing a document in 3 s instead of 50 s. But its latents collapsed
+too (cosine 0.99 across documents, mean-pooled layer-2 states dominated by a
+shared large component), so these numbers also come from recall.
 
 ## 4. The reader
 
@@ -184,8 +192,8 @@ answer = generate(prefix, latents with the chosen units' blocks raw, window, que
   questions: EM +0.06, F1 +0.02 at 8 blocks; not significant against the
   full document, significant against the simpler recall policies) from the
   latents plus ~2.7 raw blocks. At 131k tokens it matches the strongest RAG
-  baseline while reading ~20x less raw text, and the latents still carry
-  gist although training never saw more than 1.3k tokens of history.
+  baseline while reading ~20x less raw text. (The latents-only gain over
+  the window, 0.30 vs 0.19, is the soft-prompt effect, not memory.)
 - Of the remaining errors at 8 blocks, 16% are the reader (wrong even with
   every gold block), 4% retrieval (evidence never a candidate) and 4%
   choice (`culprit` in `recall_ablation`).
@@ -199,6 +207,7 @@ answer = generate(prefix, latents with the chosen units' blocks raw, window, que
 | nothing attends to the latents | transformers reads position gaps as packed-sequence boundaries | explicit all-ones `attention_mask` |
 | `CheckpointError` in backward | LoRA on/off flag differs at recomputation | no gradient checkpointing |
 | latents that regenerate a block exactly wreck the model as context | optimised for "recite this", ~3.3x embedding RMS | keep memory latents and exact recall separate; recall from raw text |
+| "latents" beat no latents, yet the model says the context is empty | latents collapsed into a constant soft prompt that only stops refusals | swap test: own vs another document's latents (and a raw-text positive control) |
 | `UR_RESULT_ERROR_DEVICE_LOST` on Intel Arc | PyTorch `_foreach_*` kernels | fused AdamW, `clip_grad_norm_(foreach=False)` |
 
 ## 9. What did not work
@@ -237,6 +246,11 @@ Costs on Modal (Nov 2026): training 250 steps ~25 min on an H100 (~$2);
 evals write one JSON line per question and resume after preemption.
 
 ## 11. Open problems
+
+- **Latents that carry document content.** Training on answer tokens only let every writer collapse
+  into a constant soft prompt. Candidates: the swap test as a training metric, a contrastive loss
+  (own latents must beat another document's on its answer), no free bias / norm scale, and
+  reconstruction-style auxiliary data as in LCLM.
 
 - Thinking with latents (weight the answer and document-dependent reasoning
   tokens; or recall during thinking).

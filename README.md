@@ -6,9 +6,17 @@ outside the context. When the model is uncertain about its answer, it recalls th
 paragraph that resolves the uncertainty and puts it back into the context. Latents are the cache;
 the raw store is the disk.
 
-On Qwen3.5-9B with HotpotQA, this matches reading the whole document at 2k and 8k tokens, and
-matches the strongest retrieval baseline on 131k-token documents under a 16k context budget, while
-reading only the latents plus about 700 raw tokens.
+On Qwen3.5-9B with HotpotQA, the recall policy matches reading the whole document at 2k and 8k
+tokens, and matches the strongest retrieval baseline on 131k-token documents under a 16k context
+budget, while reading only about 700 raw tokens.
+
+> **Important correction.** In every trained run, the latents did *not* work as memory. A swap test
+> (the document's own latents against another document's) shows they are nearly identical across
+> documents (cosine 0.99–1.00), and the reader's answers don't depend on which document's latents
+> it gets. They act as a learned soft prompt whose main effect is to stop the instruct model from
+> refusing ("the provided documents do not contain…"). The recall results stand, since they come
+> from raw text. Making the latents carry document content is the open problem; see
+> "The latents collapsed" below.
 
 This is a research experiment by an independent researcher, done with a few tens of dollars of
 cloud GPU time. It is shared as a technical record, not as a finished paper.
@@ -22,8 +30,9 @@ Worth putting out, yes. A full conference paper, not yet.
 - **It fills a gap that the closest work points at.** Memorilla (arXiv 2610.21375) finds that its
   latent memory and RAG solve different questions (on FactKG, 15.9% are solved only by Memorilla
   and 10.0% only by RAG), that their union beats both, and it explicitly names "hybrid retrieval and
-  latent-memory systems" as future work. This is such a hybrid: latents for gist, plus
-  uncertainty-triggered recall of the raw text.
+  latent-memory systems" as future work. This is an attempt at such a hybrid: latents in the
+  context, plus uncertainty-triggered recall of the raw text. The recall half works; the latent half
+  collapsed (see below), and that negative result is useful too.
 - **Recall over latents exists, but how to choose what to expand is open.** Coca-Cola (arXiv
   2611.06500) and LatentPress (arXiv 2609.01507) compress into latents with no way back to the
   original; Memorilla produces a fixed set of query-conditioned memory tokens without recall. The
@@ -46,15 +55,19 @@ Worth putting out, yes. A full conference paper, not yet.
     scale and becoming attention sinks; recall heads silently degrading the latents through shared
     gradients; transformers 5.x treating gaps in `position_ids` as packed-sequence boundaries and
     blocking attention to the latents.
-  - With thinking on, the model reasons the latents away ("only one snippet is provided"), while
-    recall keeps working.
+  - **Latents trained only on answer tokens collapse into a constant soft prompt,** and the usual
+    checks miss it: "better than no latents" turned out to be refusal suppression. A swap test
+    (own vs another document's latents), with a raw-text positive control, catches it.
+  - Asked "what do you see in your context window?", Qwen3.8-27B with collapsed latents reported an
+    empty context, "the question repeated twice", or an invented system instruction. Its
+    self-report was right that nothing was there, but it confabulated what was.
 - **Independent confirmation of the design.** LatentPress, built separately, makes the same core
   choices: a frozen reader, latents fed into the input-embedding layer, and a CE + KL
   self-distillation loss. It also finds 16x to be the hard rate and compressed context sometimes
   beating raw context.
-- **The headline result is solid as parity.** Recall matches reading the full document at 2k and 8k
-  tokens, and the best RAG baseline at 131k tokens within a 16k budget, from a fraction of the raw
-  text.
+- **The headline result is solid as parity, and it is a recall result.** Recall matches reading the
+  full document at 2k and 8k tokens, and the best RAG baseline at 131k tokens within a 16k budget,
+  from a fraction of the raw text.
 
 ### Why it is not a full paper yet
 
@@ -74,6 +87,7 @@ Worth putting out, yes. A full conference paper, not yet.
   The contribution is the *selection policy* for recall (when to recall and which segment), its
   comparison against alternatives with a per-question failure breakdown, and doing it with a frozen
   reader and a cheap LoRA compressor; not the cache hierarchy itself.
+- **The latents don't carry document content yet** (see "The latents collapsed").
 - **The reader is frozen, which may cap the results.** LCLM reports that frozen-decoder and LoRA
   variants "substantially underperform" full end-to-end training. It also compacts the model's own
   reasoning into latents almost losslessly (MATH 90.5% vs 92.5%) with a decoder trained on
@@ -91,9 +105,10 @@ Worth putting out, yes. A full conference paper, not yet.
    HotpotQA. It needs inference only.
 2. **A lightweight writer** in the style of LatentPress, to cut the compression cost. Implemented
    (`train --writer pool`; see `latent_memory.md`, section 3). It trains about 4x faster and
-   compresses about 16x faster in practice (3 s vs 50 s per 131k-token document). Its latents are
-   weaker on their own, but with recall it is nearly as good: V4 reaches 0.54 vs 0.57 EM at 8 blocks,
-   and at 131k tokens it ties RAG-fill over 64 questions while beating truncation by +0.34 EM.
+   compresses about 16x faster in practice (3 s vs 50 s per 131k-token document). With recall it
+   performs about the same (V4: 0.54 vs 0.57 EM at 8 blocks; at 131k tokens it ties RAG-fill over 64
+   questions and beats truncation by +0.34 EM), but its latents collapsed too, so those numbers also
+   come from recall.
 3. Benchmarks where keyword RAG struggles: chains whose next hop is not named in the question (RULER
    variable tracking), memory with updated facts (LongMemEval), and one benchmark shared with
    Memorilla (NarrativeQA or TriviaQA).
@@ -106,7 +121,7 @@ Worth putting out, yes. A full conference paper, not yet.
 Qwen3.5-9B, frozen; compressor = the same model + LoRA, trained 1000 steps on HotpotQA answer tokens;
 thinking off. EM / F1.
 
-| setting | full document / best baseline | latents only | latents + recall | latents + gold blocks |
+| setting | full document / best baseline | latents only (soft prompt, see below) | latents + recall | latents + gold blocks |
 |---|---|---|---|---|
 | 8 blocks (~2k tokens), 128 questions | full 0.51 / 0.69 | 0.24 / 0.32 | **0.57 / 0.71** | 0.63 / 0.78 |
 | 32 blocks (~8k tokens), 128 questions | full 0.48 / 0.67 | 0.21 / 0.29 | **0.53 / 0.67** | 0.64 / 0.79 |
@@ -117,13 +132,29 @@ recall; BM25 over paragraphs proposes 4 candidates; each candidate is expanded i
 leaving the lowest entropy is kept; then a second hop retrieves again with the question plus what
 was just read. At most two paragraphs are recalled.
 
+### The latents collapsed
+
+| | 9B LoRA compressor | 9B pool writer | 27B pool writer |
+|---|---|---|---|
+| cosine of the same latent slot across documents | 1.000 | 0.989 | 0.996 |
+| answer CE: own latents / another document's latents / none | 1.609 / 1.608 / 2.917 | 1.571 / 1.568 / 2.953 | 1.776 / 1.763 / 1.882 |
+
+On 32 documents with the 9B LoRA compressor:
+- **Two documents' latents differ by 1.45% of their norm.**
+- **Generated answers are equally right or wrong** with own and swapped latents on all 32.
+- **The positive control works:** another document's *raw* text raises answer CE from 1.05 to 2.98,
+  so the instrument does detect document-specific content.
+- **The "latents" gain is refusal suppression.** Without latents the model refuses on 70 of 128
+  questions; with them it never refuses. It is right on about a third of the questions it answers,
+  either way (`latent_diag`, `probe`).
+
 ## Files
 
 | file | what |
 |---|---|
 | `latent_memory.md` | **Start here.** How the mechanism works and how to implement it: layout, compressor, reader, training, recall, pitfalls, what did not work, how to run. |
 | `RESULTS.md` | Full experiment log in the order it happened, including the dead ends: a byte-level prototype, Qwen3-0.6B, latent capacity ("cramming"), recall decisions, and Qwen3.5-9B. |
-| `rolling_latent_chat.py` | The working system: Qwen3.5-9B, chat-format HotpotQA, training (`train`), evaluation (`chat_eval`, `recall_ablation`, `long_eval`), and a demo that prints answers (`chat_demo`). |
+| `rolling_latent_chat.py` | The working system: Qwen3.5-9B, chat-format HotpotQA, training (`train`), evaluation (`chat_eval`, `recall_ablation`, `long_eval`), a demo that prints answers (`chat_demo`), and the latent checks (`latent_diag` swap test, `probe` "what do you see?"). |
 | `rolling_latent_qwen.py` | The core model (`RollingQwen`: compressor, reader, latent positions, LoRA), plus the Qwen3-0.6B experiments, `recall_eval`, `needle_eval` and TokUR. |
 | `cram.py` | Capacity experiments: how much text a frozen model regenerates from a few optimised vectors, and an encoder for them. |
 | `rolling_latent_lm.py`, `rolling_latent_lm.md` | The original byte-level prototype and its design notes. It is kept as history; its latents collapsed. |

@@ -230,7 +230,8 @@ after the window, exact match of the 5-digit code, 64 questions.
 - **A short context with the right block beats reading everything** (1.00
   vs 0.80), as the "you don't need long context" paper argues.
 - **Latents help the lookahead** (0.61 vs 0.33, 0.48 vs 0.34) even at 4x
-  the distances seen in training.
+  the distances seen in training. *(Unverified as memory: see "Correction:
+  the latents were a soft prompt" below; no swap test was run on 0.6B.)*
 - **Candidate retrieval is the unsolved part:** choosing among 64 blocks
   succeeds less than half the time and the full lookahead costs 6x reading
   the whole document; the trained pointer is at chance. Next: a cheap
@@ -256,10 +257,11 @@ H100 with flash-linear-attention: ~4–6 s per step of 4 questions, 37 GB.
 | latents compressed knowing the question | 0.31 (0.35) | 0.28 (0.34) | 0.25 (0.33) | 0.25 (0.31) |
 | latents + gold blocks expanded | 0.59 (0.72) | 0.56 | 0.56 | 0.59 (0.72) |
 
-- **First time latents carry answer-level content:** at step 250 they
-  recover about two thirds of what the full documents add over the window
-  (±0.08 noise at 32 questions); it drifted to about half by step 1000
-  (10 -> 8 of 32 correct), so the best checkpoint is early. With Qwen3-0.6B
+- ~~First time latents carry answer-level content~~ **Wrong, see the
+  correction below:** the latents were a near-constant soft prompt; the gain
+  over the window (two thirds at step 250, half at step 1000) is the model
+  no longer refusing ("the documents do not contain…") and answering from
+  its own knowledge. With Qwen3-0.6B
   the passkey from latents was always 0. Question-conditioned compression
   is no better than streaming compression here.
 - **Latents + the gold blocks beat reading everything** (0.59 vs 0.44 EM).
@@ -282,10 +284,10 @@ dense top-4, lookahead, up to two blocks):
 
 Gold blocks expanded: 5/5. Thinking on: full 5/5, latents 0/5, recall 3/5
 (the same three).
-- **Latents give gist** ("ViacomCBS" where the window alone says "Time
-  Warner"; Avantages answered from latents alone), and fail cleanly (the
-  same wrong guess as no memory for Salieri).
-- **Recall turns gist into exact answers when retrieval finds the block;**
+- ~~Latents give gist~~ **Wrong, see the correction below:** "ViacomCBS"
+  and "Avantages" were the model's own knowledge, unlocked because the
+  latents stop it refusing.
+- **Recall supplies the exact answers when retrieval finds the block;**
   both misses are retrieval misses.
 - **With thinking on, the model reasons the latents away.** Its traces
   say things like "a set of documents (though only one snippet is
@@ -436,8 +438,8 @@ questions):
 - **V4 matches the strongest RAG baseline** while reading about 20x less
   raw text (latents + ~2.7 blocks vs 14k tokens of retrieved paragraphs),
   and is far above truncation (what a plain 16k model would see).
-- **Latents alone carry gist even 131k tokens back** (0.30 vs 0.19), well
-  beyond the 1.3k-token span the compressor was trained on.
+- ~~Latents alone carry gist even 131k tokens back~~ (0.30 vs 0.19): the
+  same soft-prompt effect, not memory (see the correction below).
 - **Compression dominates the cost:** ~50 s of ~79 s per question on an
   L40S go to compressing 512 blocks.
 - RAG-fill does well because HotpotQA questions share words with their
@@ -446,12 +448,58 @@ questions):
   aggregation over the whole document, and memory with updated facts and
   paraphrased questions (LongMemEval).
 
-**Where this leaves the idea.** The system does what it was designed for
-once the reader is capable enough: on Qwen3.5-9B, latents give gist,
-uncertainty-triggered lookahead recall with paragraph units and a second
-hop finds the evidence, and the result matches reading everything (up to
-8k tokens) or the best RAG baseline (131k tokens under a 16k budget) from
-a fraction of the raw text. The small models never got there: with
+**LatentPress-style lightweight writer (`--writer pool`, `chat9b_pool`).**
+The reader's bottom 2 layers (frozen) + an identity-initialised 4096x4096
+linear adapter (16.8M trainable, no LoRA), mean-pooled per 16-token
+sub-span; 500 steps at lr 1e-4, 0.7–1.3 s per step and 24 GB on an H100
+(LoRA compressor: 4–6 s, 37 GB).
+
+| | LoRA compressor | pool writer |
+|---|---|---|
+| 32 q, 4 blocks: latents EM (F1) | 0.31 (0.34) at step 250 | 0.22 (0.27) at step 500 |
+| 128 q, 8 blocks: V4 recall EM / F1 | 0.57 / 0.71 | 0.54 / 0.68 |
+| 128 q, 8 blocks: V4 culprits reader / retrieval / choice | 0.16 / 0.04 / 0.04 | 0.20 / 0.02 / 0.06 |
+| 131k tokens, 16k budget: V4 EM / F1 | 0.48 / 0.66 (27 q) | 0.45 / 0.57 (64 q) |
+| 131k tokens: seconds per question (compression) | 79 (50) | **30 (3)** |
+
+Over all 64 questions at 131k tokens (pool writer): V4 ties RAG-fill (EM
++0.031, t 0.6; F1 −0.051, t −1.1) from ~700 raw tokens instead of 14k,
+beats truncation to 16k by EM +0.34 (better on 23 questions, worse on 1,
+t 5.4) and V0 by +0.125 (t 3.0). On the 18 questions both writers saw, they
+agree within one question in every mode. ~~The better default at scale~~:
+its latents also carry no document content (see the correction below); the
+end-to-end numbers come from recall.
+
+**Correction: the latents were a soft prompt, not memory.** Asked what it
+sees (`probe`), Qwen3.8-27B with pool-writer latents reported an empty
+context, "the question repeated twice", or an invented system instruction,
+and listed 0 of 15 true titles (15/15 from raw text). `latent_diag` then
+showed the latents of every writer are near-constant across documents:
+
+| | 9B LoRA compressor | 9B pool writer | 27B pool writer |
+|---|---|---|---|
+| cosine of the same slot across documents | 1.000 | 0.989 | 0.996 |
+| answer CE, own latents / another document's latents / none | 1.609 / 1.608 / 2.917 | 1.571 / 1.568 / 2.953 | 1.776 / 1.763 / 1.882 |
+
+On 32 documents (9B LoRA): two documents' latents differ by 1.45% of their
+norm; generated answers are equally right or wrong with own and swapped
+latents on 32 of 32; the positive control (another document's *raw* text)
+raises answer CE from 1.05 to 2.98, so the instrument works. Without
+latents the instruct model refuses on 70 of 128 questions ("the provided
+documents do not contain…") and is right 31% of the time when it answers;
+with latents it never refuses and is right 33% of the time. So the
+"latents" results measured refusal suppression by a learned soft prompt.
+Training on answer tokens only made a constant prompt the easy optimum,
+and nothing rewarded document-specific content. Every writer collapsed;
+the swap test (own vs another document's latents) is the check that shows
+it, and it should have been run from the start.
+
+**Where this leaves the idea.** Uncertainty-triggered lookahead recall
+with paragraph units and a second hop finds the evidence, and with it the
+system matches reading everything (up to 8k tokens) or the best RAG
+baseline (131k tokens under a 16k budget) from a fraction of the raw text.
+That result stands. The latent context did not work as memory in any run;
+it acted as a soft prompt that stops the model refusing. The small models never got there: with
 Qwen3-0.6B on enwik8 continuation the latents kept almost nothing, though
 objective, task and reader all changed together, so size alone is not
 proven to be the cause. Open: thinking with latents, a learned retriever
@@ -459,10 +507,11 @@ for the remaining misses, streaming generation with recall mid-answer,
 and benchmarks that RAG cannot solve.
 
 What we learned:
+- **Run a swap test** (own vs another document's latents) on any latent
+  memory. "Better than no latents" can be a prompt effect.
 - **Always measure the no-memory control.** "Student close to teacher"
   meant nothing here; the comparison that matters is student with vs
   without latents, and with the window removed.
 - **A from-scratch byte model on enwik8 is a poor test bed for context
   compression;** a pretrained model with strong in-context retrieval gives
   a teacher worth imitating and tests (copy, passkey) with real signal.
-

@@ -835,6 +835,7 @@ def print_long(res):
 PROBES = {"describe": "What do you see in the documents above? Describe them in detail.",
           "titles": "List the titles of the documents above, one per line.",
           "question": None}                                        # None: the HotpotQA question of the sample
+UNFRAMED = "What do you see in your context window?"                # asked with no "documents" framing at all
 
 
 def probe_titles(s: Sample, tok):
@@ -902,6 +903,28 @@ def probe(model, tok, val_set, pool, n_docs=12, n_blocks=8, show=4, max_new=200,
                         print(f"--- {key}{extra}\n{ans[:700]}")
                         if thinking:
                             print(f"    (thinking: {r[key]['thought'][:400]!r})")
+        # unframed: the user turn starts directly with the latents / text / nothing; no instruction, no tags
+        s.prefix = torch.tensor(tok.encode("<|im_start|>user\n"), device=dev)
+        s.P = len(s.prefix)
+        lat_u = compress_doc(model, s, qcond=False)
+        ctx_u = {"latents": parts_for(s, lat_u), "full": parts_for(s, None, raw_all=True),
+                 "none": [("raw", s.prefix[None], 0)]}
+        ts_u = s.tail_start(with_window=False)
+        for thinking in (False, True):
+            tail = torch.tensor(tok.encode(f"\n\n{UNFRAMED}<|im_end|>\n<|im_start|>assistant\n"
+                                           + ("<think>\n" if thinking else "<think>\n\n</think>\n\n")), device=dev)[None]
+            for cname, parts in ctx_u.items():
+                if thinking and cname == "none":
+                    continue
+                ans, _ = generate(model, parts, tail, ts_u, tok, max_new=max_new, think_budget=think_budget if thinking else 0)
+                key = f"unframed{'_think' if thinking else ''}_{cname}"
+                hit, inv = title_hits(ans, titles)
+                r[key] = dict(text=ans, title_hits=hit, invented=inv, f1=None,
+                              thought=generate.last_text.split("</think>")[0][:600] if thinking else None)
+                if k < show:
+                    print(f"--- {key} [titles {hit}/{len(titles)}, invented lines {inv}]\n{ans[:700]}")
+                    if thinking:
+                        print(f"    (thinking: {r[key]['thought'][:400]!r})")
         rows.append(r)
         if f:
             f.write(json.dumps(r) + "\n"); f.flush()
@@ -917,6 +940,112 @@ def probe(model, tok, val_set, pool, n_docs=12, n_blocks=8, show=4, max_new=200,
             print(f"  {key:>22}: true titles mentioned {th:.3f} | invented lines {np.mean([r[key]['invented'] for r in rows]):.1f}")
     model.train()
     return rows
+
+
+# ============================================================================ are the latents empty?
+
+@torch.no_grad()
+def latent_diag(model, tok, val_set, pool, n_docs=16, n_blocks=8, topk=10, seed=555):
+    """Do the latents carry anything? (1) RMS vs token embeddings, cosine within / across documents, effective
+    rank; (2) lexical lens: nearest input-embedding tokens of each latent vs the tokens it pools (own vs another
+    document's latent at the same slot = chance); (3) reader dependence: answer CE with own latents, with another
+    document's latents, with none; (4) attention mass of the full-attention layers on latent positions."""
+    model.eval()
+    c, dev = model.c, next(model.parameters()).device
+    rng = random.Random(seed)
+    E = model.lm.get_input_embeddings().weight.float()                 # (V, D)
+    En = F.normalize(E, dim=-1)
+    emb_rms = float(E.pow(2).mean().sqrt())
+    samples, lats = [], []
+    for k, qi in enumerate(rng.sample(range(len(val_set)), n_docs)):
+        s = Sample(val_set[qi], pool, tok, c, n_blocks, random.Random(seed + k), dev=dev)
+        samples.append(s)
+        lats.append(torch.cat(compress_doc(model, s, qcond=False), 1)[0].float())   # (n_blocks * K, D)
+    L = torch.stack(lats)                                              # (docs, slots, D)
+    res = {"latent_rms_over_emb_rms": float(L.pow(2).mean(-1).sqrt().mean() / emb_rms)}
+    Ln = F.normalize(L, dim=-1)
+    within = torch.stack([(Ln[d] @ Ln[d].T)[~torch.eye(Ln.shape[1], dtype=torch.bool, device=dev)].mean() for d in range(n_docs)])
+    res["cos_within_doc"] = float(within.mean())
+    res["cos_same_slot_across_docs"] = float(torch.stack([(Ln[a] * Ln[b]).sum(-1).mean()
+                                                          for a in range(n_docs) for b in range(a + 1, n_docs)]).mean())
+    sv = torch.linalg.svdvals(L.reshape(-1, L.shape[-1]) - L.reshape(-1, L.shape[-1]).mean(0))
+    p = sv ** 2 / (sv ** 2).sum()
+    res["effective_rank"] = float(torch.exp(-(p * torch.log(p.clamp_min(1e-12))).sum()))
+    res["top1_variance_share"] = float(p[0])
+    # (2) lexical lens
+    span = c.block // c.k_lat
+    own, other = [], []
+    for d, s in enumerate(samples):
+        toks = s.doc[:s.Ld].view(-1, span)                            # (slots, span) the tokens each latent pools
+        near = (F.normalize(L[d], dim=-1) @ En.T).topk(topk, -1).indices          # (slots, topk)
+        near_o = (F.normalize(L[(d + 1) % n_docs], dim=-1) @ En.T).topk(topk, -1).indices
+        for j in range(toks.shape[0]):
+            t = set(toks[j].tolist())
+            own.append(len(t & set(near[j].tolist())) / topk)
+            other.append(len(t & set(near_o[j].tolist())) / topk)
+    res["lens_hit_own"], res["lens_hit_other_doc"] = float(np.mean(own)), float(np.mean(other))
+    # (3) reader dependence on the gold answer, (4) attention mass
+    ce = {"own": [], "swapped": [], "none": [], "raw": [], "raw_swapped": []}
+    gen = {"own": [], "swapped": []}
+    att_lat = []
+    for d, s in enumerate(samples):
+        tail = torch.cat([s.window()[0], s.suffix, s.answer])[None]
+        n = len(s.answer)
+        own_l = [L[d:d + 1, j * c.k_lat:(j + 1) * c.k_lat] for j in range(s.n)]
+        oth_l = [L[(d + 1) % n_docs:(d + 1) % n_docs + 1, j * c.k_lat:(j + 1) * c.k_lat] for j in range(s.n)]
+        so = samples[(d + 1) % n_docs]                                 # positive control: another document's raw text
+        raw_other = [("raw", s.prefix[None], 0)] + [("raw", so.block(j), s.P + j * s.Bk) for j in range(s.n)]
+        for name, parts in (("own", parts_for(s, own_l)), ("swapped", parts_for(s, oth_l)), ("none", parts_for(s, None)),
+                            ("raw", parts_for(s, None, raw_all=True)), ("raw_swapped", raw_other)):
+            lg = answer_logits(model, parts, tail, s.tail_start(), n)
+            ce[name].append(float(F.cross_entropy(lg[0], s.answer)))
+        qtail = torch.cat([s.window()[0], s.suffix])[None]              # end metric: generated answers, own vs swapped
+        for name, parts in (("own", parts_for(s, own_l)), ("swapped", parts_for(s, oth_l))):
+            pred, _ = generate(model, parts, qtail, s.tail_start(), tok)
+            gen[name].append(em_f1(pred, s.ex["a"])[1] >= 0.5)
+        if d < 4:
+            try:
+                h, seg, off, att = model.student(parts_for(s, own_l), tail, s.tail_start(), attentions=True)
+                q = torch.arange(off, h.shape[1], device=dev)
+                lat_mask = seg >= 1                                    # part 0 is the raw prefix; 1.. are latent blocks
+                per_layer = [float(a[0][:, q][:, :, lat_mask].sum(-1).mean()) for a in att if a is not None]
+                att_lat.append(per_layer)
+            except Exception as e:                                     # attention maps unavailable for this model
+                res["attention_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+    for k_, v in ce.items():
+        res[f"answer_ce_{k_}"] = float(np.mean(v))
+    res["correct_own_latents"], res["correct_swapped_latents"] = float(np.mean(gen["own"])), float(np.mean(gen["swapped"]))
+    res["same_answer_correctness"] = float(np.mean([a == b for a, b in zip(gen["own"], gen["swapped"])]))
+    D = L.reshape(n_docs, -1)                                          # how far apart are documents' latents, absolutely?
+    res["latent_diff_between_docs_over_norm"] = float(torch.stack([(D[a] - D[b]).norm() / D[a].norm()
+                                                                   for a in range(n_docs) for b in range(a + 1, n_docs)]).mean())
+    if att_lat:
+        res["attn_to_latents_per_full_layer"] = [round(float(x), 3) for x in np.mean(att_lat, 0)]
+        res["latent_share_of_context"] = float((n_blocks * c.k_lat) / (n_blocks * c.k_lat + len(samples[0].prefix)
+                                                                     + s.W + len(samples[0].suffix)))
+    model.train()
+    return res
+
+
+def print_diag(res):
+    print("\nARE THE LATENTS EMPTY?")
+    print(f"  size: latent RMS / token-embedding RMS {res['latent_rms_over_emb_rms']:.3f}")
+    print(f"  diversity: cosine within a document {res['cos_within_doc']:.3f} | same slot across documents "
+          f"{res['cos_same_slot_across_docs']:.3f} | effective rank {res['effective_rank']:.1f} "
+          f"(top direction {res['top1_variance_share']:.1%} of variance)")
+    print(f"  lexical lens: pooled tokens among a latent's 10 nearest embeddings: own {res['lens_hit_own']:.3f} vs "
+          f"another document's latent {res['lens_hit_other_doc']:.3f}")
+    print(f"  reader: gold-answer CE with own latents {res['answer_ce_own']:.3f} | another document's latents "
+          f"{res['answer_ce_swapped']:.3f} | no latents {res['answer_ce_none']:.3f} | raw text {res['answer_ce_raw']:.3f}"
+          f" | POSITIVE CONTROL another document's raw text {res['answer_ce_raw_swapped']:.3f}")
+    print(f"  generated answers correct (F1>=0.5): own latents {res['correct_own_latents']:.3f} | another document's "
+          f"latents {res['correct_swapped_latents']:.3f} | same correctness {res['same_answer_correctness']:.3f}")
+    print(f"  ||latents(doc a) - latents(doc b)|| / ||latents(doc a)||: {res['latent_diff_between_docs_over_norm']:.4f}")
+    if "attn_to_latents_per_full_layer" in res:
+        print(f"  attention from window/question/answer onto latents, per full-attention layer (latents are "
+              f"{res['latent_share_of_context']:.0%} of positions): {res['attn_to_latents_per_full_layer']}")
+    if "attention_error" in res:
+        print(f"  attention maps: {res['attention_error']}")
 
 
 def print_chat_report(res):
@@ -1066,8 +1195,15 @@ def selftest():
         eos_token_id = -1
     rows = probe(pm, ProbeTok, data[:6], data, n_docs=2, n_blocks=3, show=1, max_new=6, think_budget=4)
     assert len(rows) == 2 and "describe_think_latents" in rows[0] and "titles_none" in rows[0]
+    assert "unframed_latents" in rows[0] and "unframed_think_full" in rows[0]
     assert title_hits("Alpha Beta\nZeta", ["alpha beta", "gamma"]) == (1, 1)
-    ok("probe runs: describe (thinking off/on), titles, question x latents / full / none")
+    ok("probe runs: describe (thinking off/on), titles, question, unframed 'what do you see' x latents / full / none")
+    for mdl in (pm, model):
+        rd = latent_diag(mdl, Tok, data[:8], data, n_docs=3, n_blocks=3)
+        assert all(np.isfinite(rd[k]) for k in ("latent_rms_over_emb_rms", "cos_within_doc", "effective_rank",
+                                                  "lens_hit_own", "answer_ce_own", "answer_ce_swapped"))
+    print_diag(rd)
+    ok("latent_diag runs for both writers (norms, diversity, lexical lens, reader dependence, attention)")
     assert em_f1("The Eiffel Tower", "eiffel tower") == (1.0, 1.0) and em_f1("Paris, France", "Paris")[1] > 0.6
     ok("EM/F1 normalisation")
     print("SELFTEST PASSED")
@@ -1107,6 +1243,11 @@ def main():
     t.add_argument("--think_budget", type=int, default=192, help="teacher reasoning tokens for thinking samples")
     for f in fields(ChatCfg):
         t.add_argument(f"--{f.name}", type=float, default=f.default)
+    ld = sub.add_parser("latent_diag", help="are the latents empty? norms, diversity, lexical lens, reader use")
+    ld.add_argument("--ckpt", required=True)
+    ld.add_argument("--data", default="hotpot")
+    ld.add_argument("--docs", type=int, default=16)
+    ld.add_argument("--blocks", type=int, default=8)
     pr = sub.add_parser("probe", help="ask the model what it sees in latents (vs raw text, vs nothing)")
     pr.add_argument("--ckpt", required=True)
     pr.add_argument("--data", default="hotpot")
@@ -1178,6 +1319,17 @@ def main():
         res = recall_ablation(model, tok, val, val, n_blocks=args.blocks, n_q=args.q, out_jsonl=args.out_jsonl,
                               variants=vs)
         print_ablation(res, [rc.name for rc in vs])
+    elif args.cmd == "latent_diag":
+        from transformers import AutoTokenizer
+        ck = torch.load(args.ckpt, map_location=pick_device())
+        c = Config(**ck["config"])
+        model = build_model(c, pick_device())
+        model.load_state_dict(ck["trainable"], strict=False)
+        tok = AutoTokenizer.from_pretrained(c.model)
+        val = load_jsonl(args.data + "_val.jsonl")
+        r = latent_diag(model, tok, val, val, n_docs=args.docs, n_blocks=args.blocks)
+        print_diag(r)
+        print(json.dumps(r))
     elif args.cmd == "probe":
         from transformers import AutoTokenizer
         ck = torch.load(args.ckpt, map_location=pick_device())
