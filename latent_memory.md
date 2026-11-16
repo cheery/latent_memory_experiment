@@ -29,7 +29,11 @@ trained on the downstream decision (Coca-Cola, arXiv 2611.06500), keeping
 contexts short with compaction plus selective reading of stored originals
 ("You don't need long context", arXiv 2611.05306), and the capacity of
 input-embedding space (Kuratov et al. 2025, "Cramming 1568 tokens into a
-single vector").
+single vector"). The closest prior work for recall is LCLM (arXiv 2606.09659),
+whose agent expands compressed segments with a learned `expand` tool;
+LatentPress (arXiv 2609.01507) independently uses the same frozen-reader,
+CE + KL design without recall. What this design adds is a training-free
+policy for *when* and *what* to expand (section 6).
 
 ## 2. Layout and positions
 
